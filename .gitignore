@@ -1,0 +1,16 @@
+# credentials and keys -- never commit
+secrets/
+*.psk
+*_ed25519
+id_*
+*.pem
+
+# generated values and rendered artifacts (recreated by the deploy scripts)
+resources.env
+cloud-init/
+logs/
+ssh-config-snippet
+
+# editor / OS noise
+*.swp
+.DS_Store
