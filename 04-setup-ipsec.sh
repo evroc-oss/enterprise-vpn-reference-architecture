@@ -27,6 +27,14 @@
 #                              initiating at once creates duplicate IKE SAs
 #                              that blackhole traffic.
 #   5. WAIT for exactly one IKE SA + child SA per side.
+#   6. TIGHTEN the evroc-cloud egress. 02 deploys that side with full egress
+#      because its gateway needs cloud-init apt for strongswan-starter; this
+#      is the first place both peer public IPs are known, and once the tunnel
+#      is verified up that cloud-init has long finished. Full egress is
+#      replaced with the minimal policy (internal 10/8, link-local, public
+#      DNS, NTP; gateway SG additionally IKE/NAT-T to the EDC peer). This
+#      protection lives HERE -- not in the optional 03 -- so it applies even
+#      when a real enterprise gateway replaces the simulated side.
 #
 # Requires: 01, 02 (evroc-cloud side), 03 (enterprise-datacenter side).
 set -euo pipefail
@@ -91,18 +99,54 @@ push_ipsec_to "$EDC_JUMPHOST_PUBLIC_IP" "$EDC_GW_PRIVATE_IP" cloud-init/ipsec.en
 say "4/5. wait for the tunnel (up to ~10 min; first boot runs cloud-init apt)"
 tunnel_installed() { # <jumphost-pubip> <gw-private-ip>
   vm_ssh_via "$1" "$2" 'sudo ipsec statusall' 2>/dev/null | grep -q "INSTALLED, TUNNEL"; }
+tunnel_up=0
 for _ in $(seq 1 60); do
   if tunnel_installed "$EDC_JUMPHOST_PUBLIC_IP" "$EDC_GW_PRIVATE_IP" \
      && tunnel_installed "$EC_JUMPHOST_PUBLIC_IP" "$EC_GW_PRIVATE_IP"; then
     edc_gw 'sudo ipsec statusall | grep -E "ESTABLISHED|INSTALLED"' | sed 's/^/  edc /'
     ec_gw  'sudo ipsec statusall | grep -E "ESTABLISHED|INSTALLED"' | sed 's/^/  ec  /'
     n_edc=$(edc_gw 'sudo ipsec statusall' | grep -c ESTABLISHED)
-    n_ec=$(ec_gw  'sudo ipsec statusall' | grep -c ESTABLISHED)
-    [[ "$n_edc" == 1 && "$n_ec" == 1 ]] \
-      && pass "tunnel up, exactly one IKE SA per side" \
-      || fail "$n_edc/$n_ec ESTABLISHED (expect 1/1) -- both sides initiated?"
-    exit 0
+    n_ec=$(ec_gw 'sudo ipsec statusall' | grep -c ESTABLISHED)
+    if [[ "$n_edc" == 1 && "$n_ec" == 1 ]]; then
+      pass "tunnel up, exactly one IKE SA per side"
+      tunnel_up=1
+    else
+      fail "$n_edc/$n_ec ESTABLISHED (expect 1/1) -- both sides initiated?"
+    fi
+    break
   fi
   sleep 10
 done
-fail "tunnel did not come up -- inspect via the jumphost: ssh edc-gateway 'sudo journalctl -u strongswan-starter -n 50'"
+[[ "$tunnel_up" == 1 ]] \
+  || fail "tunnel did not come up -- inspect via the jumphost: ssh edc-gateway 'sudo journalctl -u strongswan-starter -n 50'"
+
+say "6. tighten evroc-cloud egress to the minimal policy"
+# 02 deploys the evroc side with full egress because its gateway installs
+# strongswan-starter via cloud-init apt (jumphost/app-vm templates install
+# no packages). The tunnel being up proves that cloud-init finished, and no
+# EC-side flow needs general internet egress any more:
+#   * internal 10/8 covers intra-subnet + both tunnel subnets, so jumphost->
+#     VM SSH, forwarded tunnel traffic and 05-verify all keep working
+#   * link-local covers the platform's DHCP-provided services (including
+#     its DNS resolver); 8.8.8.8/8.8.4.4 cover public DNS
+#   * NTP is UDP/123 to anywhere (timesyncd's ntp.ubuntu.com resolves to
+#     varying IPs)
+for sg in evroc-cloud-sg evroc-cloud-jumphost-sg; do
+  evroc networking securitygroup removerule "$sg" --name=allow-egress >/dev/null 2>&1 || true
+  ensure_rule "$sg" allow-egress-internal      Egress All "" 10.0.0.0/8
+  ensure_rule "$sg" allow-egress-linklocal     Egress All "" 169.254.0.0/16
+  ensure_rule "$sg" allow-egress-dns-primary   Egress All "" 8.8.8.8/32
+  ensure_rule "$sg" allow-egress-dns-secondary Egress All "" 8.8.4.4/32
+  ensure_rule "$sg" allow-egress-ntp           Egress UDP 123 0.0.0.0/0
+done
+# Gateway SG only: IKE/NAT-T egress to the actual EDC peer (remove+re-add so
+# a changed peer IP updates the rules, same pattern as the ingress rules in
+# step 2). Needed for EC->EDC flows re-encapsulated towards the peer and for
+# re-initiation from this responder (dpdaction=restart); ordinary IKE
+# replies are stateful returns.
+for name in allow-egress-ike-to-peer allow-egress-natt-to-peer; do
+  evroc networking securitygroup removerule evroc-cloud-sg --name "$name" >/dev/null 2>&1 || true
+done
+ensure_rule evroc-cloud-sg allow-egress-ike-to-peer  Egress UDP 500  "$EDC_GW_PUBLIC_IP/32"
+ensure_rule evroc-cloud-sg allow-egress-natt-to-peer Egress UDP 4500 "$EDC_GW_PUBLIC_IP/32"
+pass "evroc-cloud egress: 10/8 + link-local + DNS (8.8.8.8, 8.8.4.4) + NTP; gateway also UDP 500/4500 -> $EDC_GW_PUBLIC_IP"

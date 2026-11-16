@@ -133,6 +133,36 @@ ssh ec-app-vm          # private app VM via ec-jumphost (also: ssh 10.0.11.x)
   needs agent forwarding (`ssh -A edc-jumphost`). Never copy private keys
   onto VMs.
 
+## Egress policy
+
+The evroc-cloud side is deployed with **full egress** because its gateway
+installs `strongswan-starter` via cloud-init `apt` on first boot. Once the
+tunnel is verified up, `04-setup-ipsec.sh` replaces full egress with a
+minimal policy on both evroc-cloud security groups:
+
+* internal `10.0.0.0/8` (own subnet + the tunnel's far subnet)
+* link-local `169.254.0.0/16` (platform DHCP-provided services, including
+  the DNS resolver handed out by the VPC)
+* public DNS servers `8.8.8.8` and `8.8.4.4`
+* NTP (UDP/123, to anywhere -- timesyncd's `ntp.ubuntu.com` resolves to
+  varying IPs)
+
+Additionally, the **gateway** security group allows IKE/NAT-T (UDP/500 +
+UDP/4500) egress to the enterprise gateway's public IP `/32` only. This
+covers ESP-in-UDP tunnel traffic re-encapsulated towards the peer and
+re-initiation by the responder (`dpdaction=restart`); ordinary IKE replies
+are stateful returns.
+
+The tightening lives in `04-setup-ipsec.sh` -- not in the optional
+`03-deploy-enterprise-datacenter.sh` -- so the protection applies even when
+a real enterprise gateway replaces the simulated side; 04 is the first
+place both peers' public IPs are known, and the verified tunnel proves the
+gateway's cloud-init `apt` has finished. Re-running
+`02-deploy-evroc-cloud.sh` re-opens full egress (a rebuilt gateway needs
+`apt` again) -- re-run `04-setup-ipsec.sh` afterwards to re-tighten. The
+enterprise-datacenter side keeps full egress throughout, so its cloud-init
+`apt` and package updates are unaffected.
+
 ## Try it yourself
 
 ```bash

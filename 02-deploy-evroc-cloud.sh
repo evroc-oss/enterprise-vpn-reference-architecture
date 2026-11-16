@@ -21,6 +21,12 @@
 # public IP is only known once both sides exist; 04-setup-ipsec.sh adds them
 # scoped to the actual peer.
 #
+# Full egress (allow-egress) is TEMPORARY: the gateway VM needs it for its
+# cloud-init apt install of strongswan-starter on first boot. 04-setup-ipsec.sh
+# removes it and installs a minimal egress policy once the tunnel is up.
+# NOTE: re-running this script re-opens full egress (a rebuilt gateway needs
+# apt again) -- re-run 04 afterwards to re-tighten.
+#
 # The route back to the enterprise subnet (10.0.10.0/24 via the gateway) is
 # installed here already -- that CIDR is an agreed design constant of the
 # VPN, so the B side can be deployed before (or without) the A side.
@@ -53,15 +59,17 @@ echo "evroc-cloud-jumphost-pubip -> $EC_JUMPHOST_PUBLIC_IP"
 
 say "== evroc-cloud: security groups =="
 # gateway SG: SSH from the subnet only (admins come in via the jumphost),
-# intra-beta, full egress. IKE/NAT-T rules arrive with 04-setup-ipsec.sh.
+# intra-beta, full egress -- TEMPORARY, needed for the gateway's cloud-init
+# apt (strongswan-starter); 04 replaces it with the minimal policy.
+# IKE/NAT-T rules arrive with 04-setup-ipsec.sh.
 ensure_sg evroc-cloud-sg evroc-cloud-vpc
 ensure_rule evroc-cloud-sg allow-egress Egress  All ""  0.0.0.0/0
 ensure_rule evroc-cloud-sg allow-ssh    Ingress TCP 22  10.0.11.0/24
 ensure_rule evroc-cloud-sg allow-intra Ingress All ""  10.0.11.0/24
 
 # jumphost/app SG: SSH from the deploy-time allow-list, traffic from both
-# example subnets, full egress. Remove+re-add so re-running with a different
-# ALLOW_SSH_CIDR_RANGE updates the rule.
+# example subnets, full egress (also temporary, see above). Remove+re-add so
+# re-running with a different ALLOW_SSH_CIDR_RANGE updates the rule.
 ensure_sg evroc-cloud-jumphost-sg evroc-cloud-vpc
 ensure_rule evroc-cloud-jumphost-sg allow-egress   Egress  All ""  0.0.0.0/0
 evroc networking securitygroup removerule evroc-cloud-jumphost-sg --name=allow-ssh >/dev/null 2>&1 || true
@@ -100,4 +108,4 @@ EC_APP_PRIVATE_IP=$(wait_vm_privateip evroc-cloud-app-vm); env_set EC_APP_PRIVAT
 echo "evroc-cloud-app-vm private IP: $EC_APP_PRIVATE_IP"
 
 ./gen-ssh-config.sh
-say "evroc-cloud side deployed. Next: 03-deploy-enterprise-datacenter.sh (optional A side), then 04-setup-ipsec.sh"
+say "evroc-cloud side deployed (full egress until 04 tightens it). Next: 03-deploy-enterprise-datacenter.sh (optional A side), then 04-setup-ipsec.sh"
